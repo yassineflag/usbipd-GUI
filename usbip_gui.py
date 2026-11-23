@@ -46,6 +46,7 @@ POLL_SEC         = 2.0         # auto-attach poll interval (clamped >= 1.0)
 DEFAULT_SUDO     = "sudo -n"   # prefix for usbip/modprobe on Linux
 USBIPD           = "usbipd"    # usbipd(.exe) on Windows
 USBIP            = "usbip"     # usbip on Linux (auto-resolved at startup)
+MODPROBE         = "modprobe"  # modprobe on Linux (auto-resolved at startup)
 CMD_TIMEOUT      = 15          # seconds per shell command
 LIST_TIMEOUT     = 5           # seconds for `usbip list -r` (host probe)
 AUTOREFRESH_SEC  = 5           # background device-list refresh
@@ -231,7 +232,7 @@ class LinuxBackend:
         return shlex.split(self.sudo_str) if self.sudo_str.strip() else []
 
     def load_module(self, quiet=False):
-        return run(self.sudo() + ["modprobe", "vhci-hcd"], quiet=quiet)
+        return run(self.sudo() + [MODPROBE, "vhci-hcd"], quiet=quiet)
 
     def module_loaded(self):
         try:
@@ -252,7 +253,7 @@ class LinuxBackend:
             m = re.match(r"\s+(\d+-[\d.]+):\s+(.*?)\s+\((\w{4}):(\w{4})\)\s*$", line)
             if m:
                 busid, name, vid, pid = m.groups()
-                devs.append({"busid": busid, "vidpid": "%s:%s" % (vid, pid),
+                devs.append({"busid": busid, "vidpid": ("%s:%s" % (vid, pid)).lower(),
                              "desc": name.strip()})
         return devs
 
@@ -269,8 +270,11 @@ class LinuxBackend:
         except OSError:
             return ""
 
-    def list_attached(self):
-        """Imported devices: [{port, local, busid, vidpid, desc}].
+    def read_ports(self):
+        return run(self.sudo() + [USBIP, "port"], quiet=True)
+
+    def list_attached(self, port_output=None):
+        """Imported devices: [{port, local, host, busid, vidpid, desc}].
 
         `busid` is the REMOTE busid -- the one the host exports and that we
         attach by.  This matters: the vhci sysfs column is called `local_busid`
@@ -283,10 +287,11 @@ class LinuxBackend:
         Comparing the local id against a remote id is what used to make the
         watcher believe an attached device was missing and re-attach it.
         """
+        if port_output is None:
+            _, port_output, _ = self.read_ports()
         att = []
-        _, out, _ = run(self.sudo() + [USBIP, "port"], quiet=True)
         port, vidpid, desc = None, "", ""
-        for line in out.splitlines():
+        for line in port_output.splitlines():
             m = re.match(r"Port (\d+):", line.strip())
             if m:
                 port, vidpid, desc = str(int(m.group(1))), "", ""
@@ -296,14 +301,16 @@ class LinuxBackend:
                 desc = m.group(1).strip()
                 vidpid = ("%s:%s" % (m.group(2), m.group(3))).lower()
                 continue
-            m = re.search(r"(\S+)\s+->\s+usbip://[\w.\-]+:\d+/(\S+)", line)
+            m = re.search(
+                r"(\S+)\s+->\s+(?:usbip://(\S+):\d+/(\S+)|"
+                r"unknown host, remote port and remote busid)\s*$", line)
             if m and port is not None:
-                att.append({"port": port, "local": m.group(1), "busid": m.group(2),
+                local, host, busid = m.groups()
+                att.append({"port": port, "local": local, "host": host or "", "busid": busid or "",
                             "vidpid": vidpid, "desc": desc})
         if att:
             return att
-        # Rootless fallback: vhci sysfs knows the ports and the LOCAL busids but
-        # not the remote ones, so identify the devices by vid:pid instead.
+        # Sysfs gives us the local ports and busids for display and explicit detach.
         for path in sorted(glob.glob("/sys/devices/platform/vhci_hcd*/status*")):
             try:
                 with open(path) as f:
@@ -322,7 +329,7 @@ class LinuxBackend:
                     pnum = str(int(pnum))
                 except ValueError:
                     pass
-                att.append({"port": pnum, "local": local, "busid": "",
+                att.append({"port": pnum, "local": local, "host": "", "busid": "",
                             "vidpid": self._vidpid_of_local(local), "desc": ""})
         return att
 
@@ -353,7 +360,7 @@ class Watcher(threading.Thread):
       * exported & not attached   -> one `usbip attach`, then back off on failure
       * host says "busy"          -> stale attachment on Windows; ONE hint, wait
 
-    Idle cost ~0: when every target is attached each tick is a single sysfs read.
+    When every target is attached, only the local ports are checked.
     Event.wait() blocks the thread; it wakes on add/remove/stop.
     """
 
@@ -372,12 +379,20 @@ class Watcher(threading.Thread):
 
     @staticmethod
     def key(host, busid):
-        return "%s/%s" % (host, busid)
+        address, separator, zone = host.partition("%")
+        return "%s%s%s/%s" % (address.lower(), separator, zone, busid)
+
+    @staticmethod
+    def device_key(device):
+        """Identify an export by its host and remote bus ID."""
+        if device.get("host") and device["busid"]:
+            return Watcher.key(device["host"], device["busid"])
+        return None
 
     def watch(self, host, busid, vidpid=""):
         k = self.key(host, busid)
         with self._lock:
-            self.targets[k] = {"host": host, "busid": busid, "vidpid": vidpid,
+            self.targets[k] = {"host": host, "busid": busid, "vidpid": vidpid.lower(),
                                "fails": 0, "next": 0.0, "ok_at": 0.0, "busy": False}
             self.status[k] = "checking"
         self.log("[watch] + %s" % k)
@@ -433,21 +448,26 @@ class Watcher(threading.Thread):
 
         now = time.monotonic()
         att = self.backend.list_attached()
-        # match on the REMOTE busid; fall back to vid:pid when `usbip port` is
-        # unavailable and we only have the sysfs view.
-        att_busids = {a["busid"] for a in att if a["busid"]}
-        att_vidpids = {a["vidpid"] for a in att if a["vidpid"]}
-
-        def attached(t):
-            return (t["busid"] in att_busids
-                    or (t["vidpid"] and t["vidpid"].lower() in att_vidpids))
+        attached = {}
+        unknown_vidpids = set()
+        for device in att:
+            key = self.device_key(device)
+            if key is None:
+                unknown_vidpids.add(device["vidpid"])
+            else:
+                attached[key] = device["vidpid"]
 
         pending = []
         for k, t in targets:
-            if attached(t) or (now - t["ok_at"] < GRACE_SEC):
+            if k in attached and attached[k] and t["vidpid"] and attached[k] != t["vidpid"]:
+                self._status(k, "waiting -- a different device is attached at this bus ID")
+            elif k in attached or (t["ok_at"] and now - t["ok_at"] < GRACE_SEC):
                 t["fails"] = 0
                 t["busy"] = False
                 self._status(k, "attached")
+            elif unknown_vidpids and (not t["vidpid"] or "" in unknown_vidpids
+                                      or t["vidpid"] in unknown_vidpids):
+                self._status(k, "waiting -- can't verify the source of an imported device")
             else:
                 pending.append((k, t))
         if not pending:
@@ -456,7 +476,7 @@ class Watcher(threading.Thread):
         exported = {}
         for host in {t["host"] for _, t in pending}:
             try:
-                exported[host] = {d["busid"] for d in
+                exported[host] = {d["busid"]: d["vidpid"] for d in
                                   self.backend.list_remote(host, timeout=LIST_TIMEOUT)}
             except Exception:
                 exported[host] = None
@@ -468,6 +488,9 @@ class Watcher(threading.Thread):
                 continue
             if t["busid"] not in exp:
                 self._status(k, "waiting -- device not present (board off / rebooting)")
+                continue
+            if t["vidpid"] and exp[t["busid"]] != t["vidpid"]:
+                self._status(k, "waiting -- the host exports a different device at this bus ID")
                 continue
             if now < t["next"]:
                 continue
@@ -532,16 +555,22 @@ UBUNTU  (Hyper-V VM)  (usbip)
     sudo apt update
     sudo apt install linux-tools-common linux-tools-$(uname -r)
 
-DO NOT run this app with sudo -- over SSH that breaks X11
-("couldn't connect to display").  Run it as your user and give usbip
-passwordless sudo:
+Run the app as your normal user. For passwordless device operations with
+sudo 1.9.10 or newer, open the policy with:
 
-    echo "$USER ALL=(root) NOPASSWD: $(command -v usbip), $(command -v modprobe)" \\
-      | sudo tee /etc/sudoers.d/usbip
-    sudo chmod 440 /etc/sudoers.d/usbip
+    sudo visudo -f /etc/sudoers.d/usbip
 
-(Or set the "sudo" field to `pkexec` for a graphical prompt -- needs a
-desktop session, not plain SSH.)
+Replace any older rule in that file with:
+
+    YOUR_USER ALL=(root) NOPASSWD: /usr/bin/usbip port, \\
+        /usr/bin/usbip ^attach -r [a-zA-Z0-9._:%-]+ -b [0-9]+-[0-9]+([.][0-9]+)*$, \\
+        /usr/bin/usbip ^detach -p [0-9]+$, /usr/sbin/modprobe vhci-hcd
+
+Use your login name and the system binary paths shown in the startup log.
+The app reports errors from usbip port at startup. On older sudo versions,
+use literal attach -r HOST -b BUSID and detach -p PORT entries for the host,
+bus IDs, and local ports you use. For interactive desktop authorization,
+set the "sudo" field to pkexec.
 
 Kernel module: loaded at startup and before each attach.  Load at boot:
     echo vhci-hcd | sudo tee /etc/modules-load.d/vhci-hcd.conf
@@ -564,11 +593,10 @@ LOCAL vs REMOTE BUSID  (why "Device busy (exported)" used to appear)
         1-1 -> usbip://172.26.0.1:3240/10-3
         ^^^ local vhci id            ^^^^ remote busid (what you attach by)
 
-The vhci sysfs column `local_busid` holds the LEFT one.  Anything that
-compares it with a remote busid concludes the device is not attached and
-re-attaches it -- and the host then answers "Device busy (exported)",
-because it is already attached... to you.  This app uses `usbip port` for
-the mapping (and vid:pid as a rootless fallback), so it does not do that.
+The app matches attachments by exporting host and remote busid. When Linux
+only reports the local port, the app shows a separate "source unknown" row
+and pauses auto-attach for any device that might already occupy that port.
+Select the local row to detach that port.
 
 A row still marked "(attached, not exported)" is a real leftover: imported
 locally while the host no longer offers that busid.  Select it and press
@@ -609,11 +637,17 @@ the usbip-only sudoers rule above does not allow.  If they fail, run the
 commands shown here in a terminal yourself.
 
 ======================================================================
-FIREWALL  (only if `usbip list` times out -- the app does NOT change this)
+FIREWALL  (if usbip list times out)
 ======================================================================
-Admin PowerShell on Windows:
-    New-NetFirewallRule -DisplayName usbipd -Direction Inbound -Action Allow \\
-      -Protocol TCP -LocalPort 3240
+Shared devices are available to clients that can reach TCP 3240. Scope the
+existing firewall rule to the Linux VM IP or trusted VM subnet. In Windows
+Administrator PowerShell:
+
+    $vmAddress = Read-Host 'Enter the Linux VM IP address or trusted VM subnet (CIDR)'
+    Set-NetFirewallRule -DisplayName 'usbipd' -RemoteAddress $vmAddress -Enabled True
+
+If the rule is missing, repair the usbipd-win installation and apply the
+scope to the restored rule.
 
 ======================================================================
 COMMANDS THE APP RUNS
@@ -657,15 +691,14 @@ class App:
         self.interval_var = tk.StringVar(value=str(POLL_SEC))
         self.autorefresh_var = tk.BooleanVar(value=True)
         self.rows = {}
-        self.port_by_busid = {}
-        self.port_by_vidpid = {}
         self._listing = False
         self._wsig = None
         self._last_msg, self._last_n = None, 0
 
         if not self.win:
-            global USBIP
+            global USBIP, MODPROBE
             USBIP = resolve_usbip()
+            MODPROBE = shutil.which("modprobe") or "/usr/sbin/modprobe"
 
         self.backend = WindowsBackend() if self.win else LinuxBackend(DEFAULT_SUDO)
         self.watcher = None
@@ -685,6 +718,7 @@ class App:
             self.refresh()
         else:
             self.log("[setup] usbip binary: %s" % USBIP)
+            self.log("[setup] modprobe binary: %s" % MODPROBE)
             self.submit(lambda: self._check(USBIP, "version",
                         "sudo apt install linux-tools-common linux-tools-$(uname -r)"))
             self.submit(self._startup_linux, name="startup")
@@ -819,21 +853,16 @@ class App:
         self.backend.load_module()
         if self.watcher.base_route is None:
             self.watcher.base_route = LinuxBackend.default_route()
-        att = self.backend.list_attached()
+        rc, out, err = self.backend.read_ports()
+        att = self.backend.list_attached(out)
         src = "usbip port" if any(a["busid"] for a in att) else "vhci sysfs"
         self.log("[setup] attached now (%s): %s" % (src, ", ".join(
             "%s%s on port %s" % (a["busid"] or a.get("local", "?"),
                                  " " + a["vidpid"] if a["vidpid"] else "", a["port"])
             for a in att) or "none"))
-        pfx = self.backend.sudo()
-        if pfx:
-            rc, _, _ = run(pfx + ["true"], timeout=5, quiet=True)
-            if rc != 0:
-                self.log("! passwordless sudo is NOT working -- attach/detach will fail.")
-                self.log('! run:  echo "%s ALL=(root) NOPASSWD: %s, %s" | sudo tee /etc/sudoers.d/usbip'
-                         % (os.environ.get("USER", "$USER"), USBIP,
-                            shutil.which("modprobe") or "/usr/sbin/modprobe"))
-                self.log("! then restart the app.  (details in Help / Setup)")
+        if rc != 0:
+            self.log("! usbip port failed: %s" % (last_line(err, out) or "rc=%d" % rc))
+            self.log("! See Help / Setup for Linux permissions and kernel module setup.")
 
     def _apply_interval(self):
         try:
@@ -851,10 +880,13 @@ class App:
         sel = self.tree.selection()
         return self.rows.get(sel[0]) if sel else None
 
-    def _need_selection(self):
+    def _need_selection(self, remote=False):
         d = self._selected()
         if not d:
             messagebox.showinfo("usbip GUI", "Select a device in the list first.")
+        elif remote and "local" in d:
+            messagebox.showinfo("usbip GUI", "Select a device exported by the Windows host.")
+            return None
         return d
 
     # ---- host detect -----------------------------------------
@@ -882,7 +914,8 @@ class App:
         else:
             self.backend.sudo_str = self.sudo_var.get()
             self._apply_interval()
-            self.submit(self._collect_linux,
+            host = self.host_var.get().strip()
+            self.submit(lambda: self._collect_linux(host),
                         self._after_list(self._fill_linux), name="list")
 
     def _after_list(self, filler):
@@ -891,9 +924,8 @@ class App:
             filler(res)
         return cb
 
-    def _collect_linux(self):
-        host = self.host_var.get().strip()
-        out = {"remote": [], "attached": [], "err": None}
+    def _collect_linux(self, host):
+        out = {"host": host, "remote": [], "attached": [], "err": None}
         try:
             out["remote"] = self.backend.list_remote(host, timeout=LIST_TIMEOUT)
         except Exception as e:  # noqa: BLE001
@@ -904,13 +936,17 @@ class App:
             pass
         return out
 
+    @staticmethod
+    def _selection_key(d):
+        return Watcher.device_key(d) or (d.get("port"), d.get("local") or d["busid"])
+
     def _remember(self):
         d = self._selected()
-        return d["busid"] if d else None
+        return self._selection_key(d) if d else None
 
-    def _restore(self, busid):
+    def _restore(self, key):
         for iid, d in self.rows.items():
-            if d["busid"] == busid:
+            if self._selection_key(d) == key:
                 self.tree.selection_set(iid)
                 return
 
@@ -934,36 +970,40 @@ class App:
             self.log("[list] %s" % data["err"])
         keep = self._remember()
         att = data["attached"]
-        self.port_by_busid = {a["busid"]: a["port"] for a in att if a["busid"]}
-        self.port_by_vidpid = {a["vidpid"]: a["port"] for a in att if a["vidpid"]}
-        host = self.host_var.get().strip()
+        ports = {}
+        for a in att:
+            key = Watcher.device_key(a)
+            if key is not None:
+                ports[key] = a["port"]
+        host = data["host"]
         self.tree.delete(*self.tree.get_children())
         self.rows.clear()
         shown = set()
-        for d in data["remote"]:
-            port = self._port_of(d)
-            if port != "-":
+        for device in data["remote"]:
+            d = {**device, "host": host}
+            port = ports.get(Watcher.device_key(d))
+            d["port"] = port
+            if port is not None:
                 shown.add(port)
             watch = "yes" if self.watcher.is_watched(host, d["busid"]) else "-"
             iid = self.tree.insert("", "end",
-                                   values=(d["busid"], d["vidpid"], d["desc"], port, watch))
+                                   values=(d["busid"], d["vidpid"], d["desc"], port or "-", watch))
             self.rows[iid] = d
-        for a in att:                     # imported but the host no longer offers it
+        for a in att:
             if a["port"] in shown:
                 continue
+            if not a["host"]:
+                status = " (attached, source unknown)"
+            elif Watcher.key(a["host"], "") != Watcher.key(host, ""):
+                status = " (attached from %s)" % a["host"]
+            else:
+                status = " (attached, not exported)"
             iid = self.tree.insert("", "end",
-                                   values=(a["busid"] or a.get("local", "?"), a["vidpid"],
-                                           (a["desc"] or "") + "  (attached, not exported)",
-                                           a["port"], "-"))
-            self.rows[iid] = {"busid": a["busid"], "vidpid": a["vidpid"],
-                              "desc": a["desc"], "port": a["port"]}
+                                   values=(a["busid"] or a["local"], a["vidpid"],
+                                           a["desc"] + status, a["port"], "-"))
+            self.rows[iid] = a
         if keep:
             self._restore(keep)
-
-    def _port_of(self, d):
-        return (self.port_by_busid.get(d.get("busid"))
-                or self.port_by_vidpid.get((d.get("vidpid") or "").lower())
-                or "-")
 
     def _refresh_watch_tree(self):
         snap = self.watcher.snapshot()
@@ -1010,44 +1050,45 @@ class App:
     def _confirm(self, d):
         if not CONFIRM_ATTACH:
             return True
-        if self._port_of(d) != "-":               # already attached -> no prompt
+        if d["port"] is not None:
             return True
         if looks_like_nic(d):
             return messagebox.askokcancel(
                 "This looks like a NETWORK ADAPTER",
-                "%s  %s  (%s)\n\n"
+                "%s  %s  (%s) from %s\n\n"
                 "Attaching a USB network adapter almost always breaks this VM's\n"
                 "routing and drops your SSH / X session (and if the Windows host\n"
                 "uses it for internet, the host loses network too).\n\n"
                 "Only continue if you have run Help / Setup -> 'Shield routing'\n"
                 "and will set the interface address by hand.\n\nAttach anyway?"
-                % (d.get("desc", ""), d["busid"], d.get("vidpid", "?")),
+                % (d.get("desc", ""), d["busid"], d.get("vidpid", "?"), d["host"]),
                 icon="warning", default="cancel")
         return messagebox.askokcancel(
             "Attach to this VM?",
-            "Attach  %s  (%s)\n%s\n\n"
+            "Attach  %s  (%s) from %s\n%s\n\n"
             "The Windows host loses this device until you Detach."
-            % (d["busid"], d.get("vidpid", "?"), d.get("desc", "")))
+            % (d["busid"], d.get("vidpid", "?"), d["host"], d.get("desc", "")))
 
     def _attach_once(self):
-        d = self._need_selection()
+        d = self._need_selection(remote=True)
         if not d or not self._confirm(d):
             return
-        host = self.host_var.get().strip()
-        self.submit(lambda: self.backend.attach(host, d["busid"]),
+        self.submit(lambda: self.backend.attach(d["host"], d["busid"]),
                     lambda _r: self.refresh(), name="attach")
 
     def _watch(self):
-        d = self._need_selection()
+        d = self._need_selection(remote=True)
         if not d or not self._confirm(d):
             return
-        self.watcher.watch(self.host_var.get().strip(), d["busid"], d.get("vidpid", ""))
+        self.watcher.watch(d["host"], d["busid"], d["vidpid"])
         self.refresh()
 
     def _unwatch(self):
         sel = list(self.wtree.selection())
-        if not sel and self._selected():
-            sel = [self.watcher.key(self.host_var.get().strip(), self._selected()["busid"])]
+        if not sel:
+            key = Watcher.device_key(self._selected() or {})
+            if key is not None:
+                sel = [key]
         if not sel:
             messagebox.showinfo("usbip GUI", "Select a kept-attached row (or a device).")
             return
@@ -1057,23 +1098,25 @@ class App:
 
     def _detach(self):
         d = self._selected()
-        if d:
-            key = self.watcher.key(self.host_var.get().strip(), d["busid"])
-        else:
+        key = Watcher.device_key(d or {})
+        if d is None:
             sel = self.wtree.selection()
             if not sel:
                 messagebox.showinfo("usbip GUI", "Select an attached device to detach.")
                 return
             key = sel[0]
-            d = {"busid": key.split("/", 1)[-1], "vidpid": ""}
-        self.watcher.unwatch(key)
-        port = d.get("port") or self._port_of(d)
-        if port in (None, "-"):
-            self.log("[detach] %s is not attached" % d["busid"])
-            self.refresh()
-            return
-        self.submit(lambda: self.backend.detach(port),
-                    lambda _r: self.refresh(), name="detach")
+        if key is not None:
+            self.watcher.unwatch(key)
+        target = self._selection_key(d) if d is not None else key
+        label = key or "port " + d["port"]
+
+        def work():
+            for a in self.backend.list_attached():
+                if self._selection_key(a) == target:
+                    return self.backend.detach(a["port"])
+            self.log("[detach] %s is no longer attached" % label)
+
+        self.submit(work, lambda _r: self.refresh(), name="detach")
 
     def _detach_all(self):
         if not messagebox.askokcancel("Detach all",

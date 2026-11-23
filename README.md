@@ -66,18 +66,22 @@ python  usbip_gui.py        # Windows, from an Administrator terminal
 
 ### Linux: don't run it with sudo
 
-Run the app as your normal user (`sudo python3 usbip_gui.py` over SSH/X11
-fails with `couldn't connect to display`) and give `usbip` passwordless sudo
-instead:
+Run the app as your normal user. For passwordless device operations with
+sudo 1.9.10 or newer, open the policy with `sudo visudo -f /etc/sudoers.d/usbip`.
+Replace any older rule in that file with this template.
 
-```
-echo "$USER ALL=(root) NOPASSWD: $(command -v usbip), $(command -v modprobe)" | sudo tee /etc/sudoers.d/usbip
-sudo chmod 440 /etc/sudoers.d/usbip
+```sudoers
+YOUR_USER ALL=(root) NOPASSWD: /usr/bin/usbip port, \
+    /usr/bin/usbip ^attach -r [a-zA-Z0-9._:%-]+ -b [0-9]+-[0-9]+([.][0-9]+)*$, \
+    /usr/bin/usbip ^detach -p [0-9]+$, /usr/sbin/modprobe vhci-hcd
 ```
 
-The app checks this at startup and prints the exact command if it's missing.
-The `sudo` field in the toolbar can be changed (e.g. to `pkexec` on a desktop
-session).
+Replace `YOUR_USER` with your login name and use the system binary paths shown
+in the app's startup log. The app reports errors from `usbip port` at startup.
+On older sudo versions, use literal `attach -r HOST -b BUSID` and
+`detach -p PORT` entries for the host, bus IDs, and local ports you use.
+For interactive authorization on a desktop session, set the toolbar's `sudo`
+field to `pkexec`.
 
 ### Optional: standalone Windows executable
 
@@ -99,14 +103,15 @@ The result is `dist\usbip_gui.exe`; run it as Administrator.
 
 ## How "Keep attached" works
 
-It never re-attaches blindly. Each poll (default 2 s) it:
+The watcher polls every 2 seconds by default.
 
-1. reads what is actually imported (`usbip port`, which maps local vhci ports
-   to remote busids; without root it falls back to vhci sysfs + vid:pid);
-2. if the watched device is already attached → does nothing;
-3. if the host isn't exporting it (board off / rebooting) → waits silently;
-4. only if the host exports it **and** it isn't attached → runs one
-   `usbip attach`; on failure it backs off and logs the reason once.
+1. It reads `usbip port` to match each local vhci port to its exporting host and
+   remote busid. When only the local port is known, the app lists it separately
+   and pauses auto-attach for devices that could match it.
+2. It leaves existing attachments alone and waits while the host isn't
+   exporting the watched device.
+3. It runs `usbip attach` when the host exports the expected device model at that
+   busid and the device is missing. On failure it backs off and logs the reason.
 
 > **Local vs remote busid.** `usbip port` shows `1-1 -> usbip://<host>:3240/10-3`.
 > The left id is the *local* vhci id (and is what sysfs calls `local_busid`);
@@ -128,10 +133,18 @@ NetworkManager made the new interface the default route. Use
 `/etc/NetworkManager/conf.d/99-usbip-gui-gadgets.conf` so USB-Ethernet
 interfaces stay unmanaged (**Undo shield** removes it).
 
-**`usbip list` times out** — allow inbound TCP 3240 on the Windows host:
+**`usbip list` times out** — verify that the Windows `usbipd` firewall rule is
+enabled and that its remote addresses include your VM. Shared devices are
+available to clients that can reach TCP 3240, so scope the rule to the VM's IP
+or the trusted VM subnet. Run this command in Administrator PowerShell.
+
+```powershell
+$vmAddress = Read-Host 'Enter the Linux VM IP address or trusted VM subnet (CIDR)'
+Set-NetFirewallRule -DisplayName 'usbipd' -RemoteAddress $vmAddress -Enabled True
 ```
-New-NetFirewallRule -DisplayName usbipd -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3240
-```
+
+If the rule is missing, repair the usbipd-win installation and apply the scope
+to the restored rule.
 
 ## What the app touches
 
